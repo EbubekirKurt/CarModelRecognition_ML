@@ -1,156 +1,158 @@
 import os
-import shutil
+import numpy as np
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, ConfusionMatrixDisplay
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from tensorflow.keras.applications import ResNet50, VGG16
+from tensorflow.keras.applications.resnet50 import preprocess_input as resnet_preprocess
+from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_preprocess
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
 import matplotlib.pyplot as plt
 
-# Veri seti dizinleri
-original_dataset_dir = "./dataset"
-base_dir = "./split_dataset"
 
-# Eğitim, doğrulama ve test klasörlerini oluşturma
-train_dir = os.path.join(base_dir, "train")
-validation_dir = os.path.join(base_dir, "validation")
-test_dir = os.path.join(base_dir, "test")
-
-# Ana klasörler oluşturuluyor
-if not os.path.exists(base_dir):
-    os.makedirs(train_dir)
-    os.makedirs(validation_dir)
-    os.makedirs(test_dir)
-
-    # Her bir sınıf için alt klasörler oluşturuluyor ve görüntüler bölünüyor
-    for class_name in os.listdir(original_dataset_dir):
-        class_path = os.path.join(original_dataset_dir, class_name)
-        if os.path.isdir(class_path):
-            print(f"{class_name} sınıfı işleniyor...")
-
-            # Alt klasörler oluşturuluyor
-            train_class_dir = os.path.join(train_dir, class_name)
-            validation_class_dir = os.path.join(validation_dir, class_name)
-            test_class_dir = os.path.join(test_dir, class_name)
-            os.makedirs(train_class_dir, exist_ok=True)
-            os.makedirs(validation_class_dir, exist_ok=True)
-            os.makedirs(test_class_dir, exist_ok=True)
-
-            # Görüntü dosyalarını al
-            images = os.listdir(class_path)
-            images = [img for img in images if os.path.isfile(os.path.join(class_path, img))]
-
-            # Veriyi %70 eğitim, %15 doğrulama, %15 test olarak böl
-            train_images, temp_images = train_test_split(images, test_size=0.3, random_state=42)
-            validation_images, test_images = train_test_split(temp_images, test_size=0.5, random_state=42)
-
-            # Görüntüleri uygun klasörlere taşı
-            for img in train_images:
-                shutil.copy(os.path.join(class_path, img), os.path.join(train_class_dir, img))
-            for img in validation_images:
-                shutil.copy(os.path.join(class_path, img), os.path.join(validation_class_dir, img))
-            for img in test_images:
-                shutil.copy(os.path.join(class_path, img), os.path.join(test_class_dir, img))
-
-    print("Veri seti başarıyla bölündü.")
-else:
-    print("Veri seti zaten bölünmüş.")
-
-# Veri artırma ve veri seti oluşturma
-datagen = ImageDataGenerator(rescale=1.0 / 255)
-
-train_generator = datagen.flow_from_directory(
-    train_dir,
-    target_size=(224, 224),
-    batch_size=32,
-    class_mode='categorical'
-)
-
-validation_generator = datagen.flow_from_directory(
-    validation_dir,
-    target_size=(224, 224),
-    batch_size=32,
-    class_mode='categorical'
-)
-
-test_generator = datagen.flow_from_directory(
-    test_dir,
-    target_size=(224, 224),
-    batch_size=32,
-    class_mode='categorical'
-)
-
-# Transfer öğrenme modeli (ResNet50)
-base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-
-# Model yapısı
-model = Sequential([
-    base_model,
-    GlobalAveragePooling2D(),
-    Dense(256, activation='relu'),
-    BatchNormalization(),
-    Dropout(0.5),
-    Dense(128, activation='relu'),
-    Dropout(0.5),
-    Dense(len(train_generator.class_indices), activation='softmax')  # Sınıf sayısına göre çıktı
-])
-
-# Modeli derleme
-model.compile(
-    optimizer='adam',
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
-
-# Model kontrol noktası ayarı
-checkpoint_path = "model_checkpoint.keras"
-checkpoint = ModelCheckpoint(
-    filepath=checkpoint_path,
-    monitor='val_loss',
-    save_best_only=True,
-    verbose=1
-)
+def load_dataset(path, img_width=224, img_height=224, selected_classes=None):
+    images = []
+    labels = []
+    class_names = []
+    if selected_classes is None:
+        # Tüm sınıfları liste olarak alıyoruz
+        selected_classes = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
+    for class_name in selected_classes:
+        class_dir = os.path.join(path, class_name)
+        if not os.path.isdir(class_dir):
+            continue
+        class_names.append(class_name)
+        for img_name in os.listdir(class_dir):
+            img_path = os.path.join(class_dir, img_name)
+            try:
+                # Görüntüyü yüklüyor ve istenilen boyuta getiriyoruz
+                img = load_img(img_path, target_size=(img_width, img_height))
+                img_array = img_to_array(img)
+                images.append(img_array)
+                labels.append(class_name)
+            except Exception as e:
+                print(f"Hata oluştu: {e}")
+    return np.array(images), np.array(labels), class_names
 
 
-# Erken durdurma
-early_stopping = EarlyStopping(
-    monitor='val_loss',
-    patience=10,
-    restore_best_weights=True
-)
+def preprocess_data(images, labels, model_name='ResNet50'):
+    if model_name == 'ResNet50':
+        preprocess_input = resnet_preprocess
+    elif model_name == 'VGG16':
+        preprocess_input = vgg_preprocess
+    else:
+        raise ValueError("Model adı 'ResNet50' veya 'VGG16' olmalıdır.")
 
-# Modeli eğitme veya yükleme
-if os.path.exists(checkpoint_path):
-    print("Kaydedilmiş model yükleniyor...")
-    model = load_model(checkpoint_path)
-else:
-    print("Yeni model eğitiliyor...")
-    history = model.fit(
-        train_generator,
-        validation_data=validation_generator,
-        epochs=50,
-        callbacks=[early_stopping, checkpoint]
-    )
+    # Görüntüleri ön işleme tabi tutuyoruz
+    images = preprocess_input(images)
+    # Etiketleri sayısal değerlere dönüştürüyoruz
+    label_encoder = LabelEncoder()
+    labels_encoded = label_encoder.fit_transform(labels)
+    return images, labels_encoded, label_encoder
 
-# Performansı değerlendirme
-loss, accuracy = model.evaluate(test_generator)
-print(f"Test Doğruluğu: {accuracy * 100:.2f}%")
 
-# Eğitim ve doğrulama doğruluklarını görselleştirme
-if 'history' in locals():  # Eğer eğitim yapıldıysa
-    plt.plot(history.history['accuracy'], label='Eğitim Doğruluğu')
-    plt.plot(history.history['val_accuracy'], label='Doğrulama Doğruluğu')
-    plt.legend()
-    plt.title('Model Doğrulukları')
-    plt.xlabel('Epochs')
-    plt.ylabel('Doğruluk')
+def extract_features(images, model_name='ResNet50'):
+    if model_name == 'ResNet50':
+        # ResNet50 modelini önceden eğitilmiş ağırlıklarla yüklüyoruz
+        base_model = ResNet50(weights='imagenet', include_top=False, pooling='avg')
+    elif model_name == 'VGG16':
+        # VGG16 modelini önceden eğitilmiş ağırlıklarla yüklüyoruz
+        base_model = VGG16(weights='imagenet', include_top=False, pooling='avg')
+    else:
+        raise ValueError("Model adı 'ResNet50' veya 'VGG16' olmalıdır.")
+    # Özellikleri çıkarıyoruz
+    features = base_model.predict(images, verbose=1)
+    return features
+
+
+def evaluate_models(X_train, X_test, y_train, y_test, class_names):
+    classifiers = {
+        'SVM': SVC(kernel='linear', probability=True),
+        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42)
+    }
+    model_results = {}
+    for clf_name, clf in classifiers.items():
+        print(f"\n{clf_name} modeli eğitiliyor...")
+        # Modeli eğitiyoruz
+        clf.fit(X_train, y_train)
+        # Tahminleri yapıyoruz
+        y_pred = clf.predict(X_test)
+        # Doğruluğu hesaplıyoruz
+        acc = accuracy_score(y_test, y_pred)
+        # Confusion Matrix oluşturuyoruz
+        cm = confusion_matrix(y_test, y_pred)
+        print(f"{clf_name} Doğruluğu: {acc * 100:.2f}%")
+        model_results[clf_name] = {
+            'accuracy': acc,
+            'confusion_matrix': cm,
+            'y_pred': y_pred
+        }
+    # En iyi modeli seçiyoruz
+    best_model_name = max(model_results, key=lambda x: model_results[x]['accuracy'])
+    best_model = model_results[best_model_name]
+    return model_results, best_model_name, best_model
+
+
+def main():
+    dataset_path = './dataset'  # Veri setinin yolu
+    img_width, img_height = 224, 224
+
+    # Veri setini yüklüyoruz (tüm sınıflar)
+    print("Veri seti yükleniyor...")
+    images, labels, class_names = load_dataset(dataset_path, img_width, img_height)
+
+    # Verileri eğitim ve test olarak bölüyoruz
+    X_train_img, X_test_img, y_train_labels, y_test_labels = train_test_split(
+        images, labels, test_size=0.2, random_state=42, stratify=labels)
+
+    # Veri ön işleme ve özellik çıkarma için kullanılacak modeli seçiyoruz
+    model_name = 'ResNet50'  # veya 'VGG16'
+
+    # Eğitim verilerini ön işliyor ve özellik çıkarıyoruz
+    print(f"\n{model_name} ile eğitim verilerinden özellikler çıkarılıyor...")
+    X_train_preprocessed, y_train_encoded, label_encoder = preprocess_data(
+        X_train_img, y_train_labels, model_name)
+    X_train_features = extract_features(X_train_preprocessed, model_name)
+
+    # Test verilerini ön işliyor ve özellik çıkarıyoruz
+    print(f"\n{model_name} ile test verilerinden özellikler çıkarılıyor...")
+    X_test_preprocessed, y_test_encoded, _ = preprocess_data(
+        X_test_img, y_test_labels, model_name)
+    X_test_features = extract_features(X_test_preprocessed, model_name)
+
+    # Özellikleri ölçeklendiriyoruz
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_features)
+    X_test_scaled = scaler.transform(X_test_features)
+
+    # Modelleri eğitiyor ve değerlendiriyoruz
+    model_results, best_model_name, best_model = evaluate_models(
+        X_train_scaled, X_test_scaled, y_train_encoded, y_test_encoded, class_names)
+
+    # En iyi modelin sonuçlarını yazdırıyoruz
+    print(f"\nEn iyi algoritma: {best_model_name}")
+    print(f"En iyi doğruluk: {best_model['accuracy'] * 100:.2f}%")
+    print("En iyi Confusion Matrix:")
+    print(best_model['confusion_matrix'])
+
+    # Sınıflandırma raporunu yazdırıyoruz
+    print("\nSınıflandırma Raporu:")
+    print(classification_report(y_test_encoded, best_model['y_pred'],
+          target_names=label_encoder.classes_))
+
+    # Confusion Matrix'i görselleştiriyoruz
+    cm = confusion_matrix(y_test_encoded, best_model['y_pred'])
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_encoder.classes_)
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title(f'{best_model_name} Confusion Matrix')
+    plt.xticks(rotation=90)
+    plt.ylabel('Gerçek Etiket')
+    plt.xlabel('Tahmin Edilen Etiket')
+    plt.tight_layout()
     plt.show()
 
-    plt.plot(history.history['loss'], label='Eğitim Kaybı')
-    plt.plot(history.history['val_loss'], label='Doğrulama Kaybı')
-    plt.legend()
-    plt.title('Model Kayıpları')
-    plt.xlabel('Epochs')
-    plt.ylabel('Kayıp')
-    plt.show()
+
+if __name__ == '__main__':
+    main()
