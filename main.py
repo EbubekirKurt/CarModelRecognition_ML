@@ -1,113 +1,179 @@
 import os
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, ConfusionMatrixDisplay
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier
+from flask import Flask, render_template, request
+import tensorflow as tf
 from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.applications.resnet50 import preprocess_input as resnet_preprocess
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-import matplotlib.pyplot as plt
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+from tensorflow.keras import layers, models, callbacks
+import tempfile
+import uuid
+
+app = Flask(__name__)
+
+MODEL_DIR = './saved_model'
+MODEL_PATH = os.path.join(MODEL_DIR, 'model.keras')
+CLASS_NAMES_PATH = os.path.join(MODEL_DIR, 'class_names.npy')
+
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+THRESHOLD = 70.0
+
+model = None
+class_names = None
+
+CLASS_TRANSLATIONS = {
+    "chevrolet_silverado_2004": "Chevrolet Silverado 2004",
+    "dodge_grand caravan_2005": "Dodge Grand Caravan 2005",
+    "ford_explorer_2003": "Ford Explorer 2003",
+    "ford_explorer_2004": "Ford Explorer 2004",
+    "ford_mustang_2000": "Ford Mustang 2000",
+    "honda_civic_2002": "Honda Civic 2002",
+    "nissan_altima_2002": "Nissan Altima 2002",
+    "nissan_altima_2003": "Nissan Altima 2003",
+    "nissan_altima_2005": "Nissan Altima 2005",
+    "non-car": "Non-Car",
+}
 
 
-def main():
-    # Veri setinin yolu ve görüntü boyutları
-    dataset_path = './dataset'
-    img_width, img_height = 224, 224
-
-    # Veri setini yüklüyoruz
-    print("Veri seti yükleniyor...")
-    images = []
-    labels = []
-    # Tüm sınıfları alıyoruz
-    class_dirs = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
-    for class_name in class_dirs:
-        class_dir = os.path.join(dataset_path, class_name)
-        for img_name in os.listdir(class_dir):
-            img_path = os.path.join(class_dir, img_name)
-            try:
-                # Görüntüyü yüklüyor ve istenilen boyuta getiriyoruz
-                img = load_img(img_path, target_size=(img_width, img_height))
-                img_array = img_to_array(img)
-                images.append(img_array)
-                labels.append(class_name)
-            except Exception as e:
-                print(f"Hata oluştu: {e}")
-
-    images = np.array(images)
-    labels = np.array(labels)
-
-    # Verileri eğitim ve test olarak bölüyoruz
-    X_train_img, X_test_img, y_train_labels, y_test_labels = train_test_split(
-        images, labels, test_size=0.2, random_state=42, stratify=labels)
-
-    # Etiketleri sayısal değerlere dönüştürüyoruz
-    label_encoder = LabelEncoder()
-    y_train_encoded = label_encoder.fit_transform(y_train_labels)
-    y_test_encoded = label_encoder.transform(y_test_labels)
-
-    # ResNet50 modelini önceden eğitilmiş ağırlıklarla yüklüyoruz
+def create_model(num_classes):
     base_model = ResNet50(weights='imagenet', include_top=False, pooling='avg')
-    preprocess_input = resnet_preprocess
+    base_model.trainable = False  # Base model donduruldu
+    inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
+    x = preprocess_input(inputs)
+    x = base_model(x, training=False)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    model = tf.keras.Model(inputs, outputs)
+    return model
 
-    # Görüntüleri ön işleme tabi tutuyoruz
-    X_train_preprocessed = preprocess_input(X_train_img)
-    X_test_preprocessed = preprocess_input(X_test_img)
 
-    # Özellikleri çıkarıyorum
-    print("\nÖzellikler çıkarılıyor...")
-    X_train_features = base_model.predict(X_train_preprocessed)
-    X_test_features = base_model.predict(X_test_preprocessed)
+def train_and_save_model():
+    dataset_path = './dataset'
+    train_ds = image_dataset_from_directory(
+        dataset_path,
+        validation_split=0.2,
+        subset="training",
+        seed=42,
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE
+    )
 
-    # Özellikleri ölçeklendiriyoruz
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_features)
-    X_test_scaled = scaler.transform(X_test_features)
+    val_ds = image_dataset_from_directory(
+        dataset_path,
+        validation_split=0.2,
+        subset="validation",
+        seed=42,
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE
+    )
 
-    # Modelleri eğitiyor ve değerlendiriyoruz
-    classifiers = {
-        'SVM': SVC(kernel='linear'),
-        'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42)
-    }
-    model_results = {}
-    for clf_name, clf in classifiers.items():
-        print(f"\n{clf_name} modeli eğitiliyor...")
-        clf.fit(X_train_scaled, y_train_encoded)
-        y_pred = clf.predict(X_test_scaled)
-        acc = accuracy_score(y_test_encoded, y_pred)
-        cm = confusion_matrix(y_test_encoded, y_pred)
-        print(f"{clf_name} Doğruluğu: {acc * 100:.2f}%")
-        model_results[clf_name] = {
-            'accuracy': acc,
-            'confusion_matrix': cm,
-            'y_pred': y_pred
+    class_names = train_ds.class_names
+
+    AUTOTUNE = tf.data.AUTOTUNE
+    train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
+    val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
+
+    num_classes = len(class_names)
+    model = create_model(num_classes)
+
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    if not os.path.exists(MODEL_DIR):
+        os.makedirs(MODEL_DIR)
+
+    checkpoint_cb = callbacks.ModelCheckpoint(
+        MODEL_PATH,
+        save_best_only=True,
+        monitor='val_accuracy',
+        mode='max',
+        verbose=1
+    )
+    early_stopping_cb = callbacks.EarlyStopping(patience=5, restore_best_weights=True)
+    reduce_lr_cb = callbacks.ReduceLROnPlateau(patience=3, factor=0.2, verbose=1)
+
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=20,
+        callbacks=[checkpoint_cb, early_stopping_cb, reduce_lr_cb]
+    )
+
+    # En iyi model zaten model.keras olarak kaydedildi.
+    # Sınıf isimleri kaydet
+    np.save(CLASS_NAMES_PATH, class_names)
+
+
+def load_model_and_classes():
+    global model, class_names
+    if os.path.exists(MODEL_PATH) and os.path.exists(CLASS_NAMES_PATH):
+        model = tf.keras.models.load_model(MODEL_PATH)
+        class_names = np.load(CLASS_NAMES_PATH)
+        print("Kayıtlı model ve sınıflar yüklendi.")
+    else:
+        print("Kayıtlı model bulunamadı, eğitim başlatılıyor...")
+        train_and_save_model()
+        model = tf.keras.models.load_model(MODEL_PATH)
+        class_names = np.load(CLASS_NAMES_PATH)
+        print("Model eğitildi ve yüklendi.")
+
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        if 'image' not in request.files:
+            return "Lütfen bir resim yükleyin."
+
+        file = request.files['image']
+        if file.filename == '':
+            return "Geçerli bir resim dosyası seçiniz."
+
+        # Geçici dosya oluşturma
+        temp_path = os.path.join(tempfile.gettempdir(), str(uuid.uuid4()) + file.filename)
+        file.save(temp_path)
+
+        # Resmi işleme ve model tahmini
+        img = tf.keras.preprocessing.image.load_img(temp_path, target_size=IMG_SIZE)
+        img_array = tf.keras.preprocessing.image.img_to_array(img)
+        img_array = tf.expand_dims(img_array, 0)
+        preds = model.predict(img_array)
+        preds = preds[0]
+        predicted_idx = np.argmax(preds)
+        predicted_class = translate_class_name(class_names[predicted_idx])
+        predicted_prob = preds[predicted_idx] * 100
+
+        # Tüm sınıflar ve olasılıkları düzenleme
+        class_probabilities = {
+            translate_class_name(cn): f"{prob*100:.2f}%" for cn, prob in zip(class_names, preds)
         }
 
-    # En iyi modeli seçiyoruz
-    best_model_name = max(model_results, key=lambda x: model_results[x]['accuracy'])
-    best_model = model_results[best_model_name]
+        # Tahmin sonucuna göre yanıt döndürme
+        if predicted_prob < THRESHOLD:
+            return render_template('index.html',
+                                   predicted_class="Model bu görüntüyü yeterince güvenli tahmin edemedi.",
+                                   predicted_prob=predicted_prob,
+                                   class_probabilities=class_probabilities,
+                                   show_result=True,
+                                   is_unsure=True)
+        else:
+            return render_template('index.html',
+                                   predicted_class=predicted_class,
+                                   predicted_prob=predicted_prob,
+                                   class_probabilities=class_probabilities,
+                                   show_result=True,
+                                   is_unsure=False)
+    else:
+        return render_template('index.html', show_result=False, is_unsure=False)
 
-    # Sonuçları yazdırıyoruz
-    print(f"\nEn iyi algoritma: {best_model_name}")
-    print(f"En iyi doğruluk: {best_model['accuracy'] * 100:.2f}%")
 
-    # Sınıflandırma raporunu yazdırıyoruz
-    print("\nSınıflandırma Raporu:")
-    print(classification_report(y_test_encoded, best_model['y_pred'],
-          target_names=label_encoder.classes_))
-
-    # Confusion Matrix'i görselleştiriyoruz
-    cm = best_model['confusion_matrix']
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_encoder.classes_)
-    disp.plot(cmap=plt.cm.Blues)
-    plt.title(f'{best_model_name} Confusion Matrix')
-    plt.xticks(rotation=90)
-    plt.ylabel('Gerçek Etiket')
-    plt.xlabel('Tahmin Edilen Etiket')
-    plt.tight_layout()
-    plt.show()
+def translate_class_name(class_name):
+    return CLASS_TRANSLATIONS.get(class_name, class_name)
 
 
 if __name__ == '__main__':
-    main()
+    load_model_and_classes()
+    app.run(debug=True)
