@@ -38,7 +38,11 @@ CLASS_TRANSLATIONS = {
 
 def create_model(num_classes):
     base_model = ResNet50(weights='imagenet', include_top=False, pooling='avg')
-    base_model.trainable = False  # Base model donduruldu
+    base_model.trainable = True
+
+    for layer in base_model.layers[:-10]:
+        layer.trainable = False
+
     inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
     x = preprocess_input(inputs)
     x = base_model(x, training=False)
@@ -50,6 +54,7 @@ def create_model(num_classes):
 
 def train_and_save_model():
     dataset_path = './dataset'
+
     train_ds = image_dataset_from_directory(
         dataset_path,
         validation_split=0.2,
@@ -70,6 +75,15 @@ def train_and_save_model():
 
     class_names = train_ds.class_names
 
+    data_augmentation = tf.keras.Sequential([
+        layers.RandomFlip("horizontal"),
+        layers.RandomRotation(0.2),
+        layers.RandomZoom(0.1),
+        layers.RandomContrast(0.1),
+    ])
+
+    train_ds = train_ds.map(lambda x, y: (data_augmentation(x, training=True), y))
+
     AUTOTUNE = tf.data.AUTOTUNE
     train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
     val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
@@ -79,7 +93,7 @@ def train_and_save_model():
 
     model.compile(
         optimizer='adam',
-        loss='sparse_categorical_crossentropy',
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
         metrics=['accuracy']
     )
 
@@ -96,15 +110,18 @@ def train_and_save_model():
     early_stopping_cb = callbacks.EarlyStopping(patience=5, restore_best_weights=True)
     reduce_lr_cb = callbacks.ReduceLROnPlateau(patience=3, factor=0.2, verbose=1)
 
+    class_weights = {
+        i: 2.0 if class_name != "non-car" else 1.0 for i, class_name in enumerate(class_names)
+    }
+
     model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=20,
+        class_weight=class_weights,
         callbacks=[checkpoint_cb, early_stopping_cb, reduce_lr_cb]
     )
 
-    # En iyi model zaten model.keras olarak kaydedildi.
-    # Sınıf isimleri kaydet
     np.save(CLASS_NAMES_PATH, class_names)
 
 
@@ -132,11 +149,9 @@ def index():
         if file.filename == '':
             return "Geçerli bir resim dosyası seçiniz."
 
-        # Geçici dosya oluşturma
         temp_path = os.path.join(tempfile.gettempdir(), str(uuid.uuid4()) + file.filename)
         file.save(temp_path)
 
-        # Resmi işleme ve model tahmini
         img = tf.keras.preprocessing.image.load_img(temp_path, target_size=IMG_SIZE)
         img_array = tf.keras.preprocessing.image.img_to_array(img)
         img_array = tf.expand_dims(img_array, 0)
@@ -146,12 +161,10 @@ def index():
         predicted_class = translate_class_name(class_names[predicted_idx])
         predicted_prob = preds[predicted_idx] * 100
 
-        # Tüm sınıflar ve olasılıkları düzenleme
         class_probabilities = {
             translate_class_name(cn): f"{prob*100:.2f}%" for cn, prob in zip(class_names, preds)
         }
 
-        # Tahmin sonucuna göre yanıt döndürme
         if predicted_prob < THRESHOLD:
             return render_template('index.html',
                                    predicted_class="Model bu görüntüyü yeterince güvenli tahmin edemedi.",
